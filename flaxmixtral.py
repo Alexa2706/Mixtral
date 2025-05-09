@@ -33,6 +33,7 @@ class FlaxMoeCausalLMOutput:
     loss: Optional[jnp.ndarray] = None
 
 
+normal = nn.initializers.normal(0.02)
 
 GLOBAL_MESH = None
 os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
@@ -326,8 +327,8 @@ class MixtralAttention(nnx.Module):
         key_states = key_states.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
 
-        # cos, sin = self.rotary_emb(hidden_states, position_ids)
-        cos, sin = position_ids
+        # cos, sin = position_ids
+        cos, sin = self.rotary_emb(hidden_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
         query_length, key_length = query_states.shape[1], key_states.shape[1]
