@@ -47,11 +47,13 @@ def main(model_id = 'mistralai/Mixtral-8x7B-v0.1',
     print(tokenizer.special_tokens_map)
 
     inputs = tokenizer(prompt, return_tensors="pt")
-
+    batch_size = 3
+    seq_len = 10
     input_ids = inputs.input_ids.to(model.device)
     attention_mask = inputs.attention_mask.to(model.device)
     print("eos_token_id in input_ids:", tokenizer.eos_token_id in input_ids[0])
-
+    input_ids = torch.randint(config.vocab_size, (8, 10)).long()
+    attention_mask = torch.ones_like(input_ids)
     print("✍️ Generating...")
     outputs = model.generate(
         input_ids,
@@ -70,10 +72,10 @@ def main(model_id = 'mistralai/Mixtral-8x7B-v0.1',
     input_ids = jnp.array(input_ids)
     attention_mask = jnp.array(attention_mask)
     flax_model = make_model(config, model)
-
+    
     for i in range(config.num_hidden_layers):
-        flax_model.model.layers[i].attn.cached_key = jnp.zeros((1, max_len, 8, 128), dtype = jnp.float32)
-        flax_model.model.layers[i].attn.cached_value = jnp.zeros((1, max_len, 8, 128), dtype = jnp.float32)
+        flax_model.model.layers[i].attn.cached_key = jnp.zeros((batch_size, max_len, 8, 128), dtype = jnp.float32)
+        flax_model.model.layers[i].attn.cached_value = jnp.zeros((batch_size, max_len, 8, 128), dtype = jnp.float32)
         flax_model.model.layers[i].attn.cache_index = jnp.array(0, dtype = jnp.int32)
 
     extended_attention_mask = jnp.ones((batch_size, max_len), dtype = "i4")
@@ -84,6 +86,8 @@ def main(model_id = 'mistralai/Mixtral-8x7B-v0.1',
         attention_mask=extended_attention_mask,
         max_new_tokens=max_len - seq_len 
     )
+    print(generated_ids.shape)
+    print(generated_ids)
     resultJax = tokenizer.decode(torch.tensor(generated_ids[0]), skip_special_tokens=False)
     if resultJax.startswith("<|begin_of_text|>"):
         resultJax = resultJax[len("<|begin_of_text|>"):].lstrip()

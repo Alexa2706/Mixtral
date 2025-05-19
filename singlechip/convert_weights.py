@@ -2,6 +2,7 @@ from singlechip.flaxmixtral import FlaxMixtralForCausalLM
 from singlechip.flaxconfigmixtral import MixtralConfig
 import jax
 import jax.numpy as jnp
+
 def make_model(configTorch, modelTorch):
     embeddings = modelTorch.model.embed_tokens.weight.detach().cpu().numpy()
     # Save LM head
