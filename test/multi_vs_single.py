@@ -15,7 +15,7 @@ from multichip.multichipmixtral import FlaxMixtralForCausalLM as ShardedModel
 from singlechip.flaxconfigmixtral import MixtralConfig
 from jax_config import cpu_devices, axis_name, num_devices, device_mesh
 
-config = MixtralConfig(num_hidden_layers=1)
+config = MixtralConfig(num_hidden_layers=2)
 prng_key = jax.random.PRNGKey(0)
 rngs = nnx.Rngs(0)
 
@@ -43,8 +43,9 @@ def run_multi_chip(input_data, attention_mask, max_len):
     print("Creating Sharded model...")
     model = ShardedModel(config)
     batch_size, seq_len = input_data.shape
-    inputs_spec = P("X")  
     
+    inputs_spec = P("X")  
+    pad_size = 0
     if batch_size % num_devices != 0:
         # Pad input to make batch size divisible by number of devices
         pad_size = num_devices - (batch_size % num_devices)
@@ -104,17 +105,16 @@ def run_multi_chip(input_data, attention_mask, max_len):
             'cached_value': P("X", None, None, None),
             'cache_index': P()
         }
-
-    position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
+    position_ids = jnp.cumsum(extended_attention_mask, axis=-1) - 1
     sharded_position_ids = jax.device_put(position_ids, NamedSharding(device_mesh, P("X", None)))
     print("Compiling model application...")
     unapplied_function = shard_map(
         lambda x, mask, cache, pos: model.generate(
-            input_ids=x,
-            attention_mask=mask,
-            key_values=cache,
+            input_ids = x,
+            attention_mask = mask,
+            past_key_values = cache,
             position_ids = pos,
-            max_new_tokens=max_len - seq_len
+            max_new_tokens = max_len - seq_len
         ),
         device_mesh,
         in_specs=(inputs_spec, P("X", None), cache_specs, P("X", None)), 
@@ -135,9 +135,9 @@ def run_multi_chip(input_data, attention_mask, max_len):
     return results
   
 if __name__ == '__main__':
-    batch_size = 2
+    batch_size = 8
     seq_len = 10
-    tokens = 2
+    tokens = 5
     max_len = seq_len + tokens
     input_data = jax.random.randint(key = prng_key, shape = (batch_size, seq_len), minval = 0, maxval = config.vocab_size)
     attention_mask = jnp.ones_like(input_data)

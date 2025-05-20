@@ -307,7 +307,6 @@ class MixtralAttention(nnx.Module):
             key_states, value_states, query_states, attention_mask
         )
         # print(query_states.shape, key_states.shape, value_states.shape)
-        
         key_states = jnp.repeat(key_states, self.num_key_value_groups, axis=2)
         value_states = jnp.repeat(value_states, self.num_key_value_groups, axis=2)
 
