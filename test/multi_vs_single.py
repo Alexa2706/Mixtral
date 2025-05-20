@@ -7,6 +7,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax import lax
+import numpy as np
+
 
 from singlechip.flaxmixtral import FlaxMixtralForCausalLM as NotShardedModel
 from multichip.multichipmixtral import FlaxMixtralForCausalLM as ShardedModel
@@ -58,10 +60,10 @@ def run_multi_chip(input_data, attention_mask, max_len):
     print("Compiling model application...")
     unapplied_function = shard_map(
         lambda x: model.generate(
-            input_ids=x,
-            attention_mask=extended_attention_mask,
-            past_key_values = past_key_values,
-            max_new_tokens=max_len - seq_len
+            input_ids = x,
+            attention_mask = extended_attention_mask,
+            key_values = past_key_values,
+            max_new_tokens = max_len - seq_len
         ),
         device_mesh,
         in_specs=(inputs_spec,),
@@ -76,16 +78,22 @@ def run_multi_chip(input_data, attention_mask, max_len):
     # Print results info
     print(f"Results shape: {results.shape}")
     print(f"Results dtype: {results.dtype}")
-    
     return results
   
 if __name__ == '__main__':
-      batch_size = 8
-      seq_len = 10
-      tokens = 5
-      max_len = seq_len + tokens
-      input_data = jax.random.randint(key = prng_key, shape = (batch_size, seq_len), minval = 0, maxval = config.vocab_size)
-      attention_mask = jnp.ones_like(input_data)
-      print(input_data)
-    #   run_single_chip(input_data, attention_mask, max_len)
-      run_multi_chip(input_data, attention_mask, max_len)
+    batch_size = 2
+    seq_len = 10
+    tokens = 5
+    max_len = seq_len + tokens
+    input_data = jax.random.randint(key = prng_key, shape = (batch_size, seq_len), minval = 0, maxval = config.vocab_size)
+    attention_mask = jnp.ones_like(input_data)
+#   print(input_data)
+    single_chip = run_single_chip(input_data, attention_mask, max_len)
+    multi_chip = run_multi_chip(input_data, attention_mask, max_len)
+    print(single_chip)
+    print()
+    print(multi_chip)
+    if np.array_equal(np.array(single_chip), np.array(multi_chip)):
+        print('Test successful!')
+    else:
+        print('Something doesnt work :(')

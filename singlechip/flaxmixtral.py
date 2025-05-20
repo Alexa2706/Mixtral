@@ -38,7 +38,6 @@ class MixtralBlockSparseTop2MLP(nnx.Module):
         super().__init__()
         embed_dim = config.hidden_size
         inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * embed_dim
-
         self.up_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
         self.gate_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
         self.down_proj = nnx.Linear(inner_dim, embed_dim, use_bias=False, rngs = rngs)
@@ -98,6 +97,7 @@ class MixtralSparseMoeBlock(nnx.Module):
             final_hidden_states = final_hidden_states.at[top_x].add(current_hidden_states)
 
         final_hidden_states = final_hidden_states.reshape(batch_size, seq_len, hid_dim)
+        # print(final_hidden_states)
         return final_hidden_states, router_logits
 
 class MixtralRMSNorm(nnx.Module):
@@ -259,7 +259,6 @@ class MixtralAttention(nnx.Module):
             tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
         )
         attention_mask = combine_masks(pad_mask, attention_mask)
-
         return key, value, attention_mask
 
     def __call__(
@@ -312,6 +311,7 @@ class MixtralAttention(nnx.Module):
                 key_states, value_states, query_states, attention_mask
             )
         # print(query_states.shape, key_states.shape, value_states.shape)
+        
         key_states = jnp.repeat(key_states, self.num_key_value_groups, axis=2)
         value_states = jnp.repeat(value_states, self.num_key_value_groups, axis=2)
         # causal_mask = self.causal_mask[:, :, :query_length, :key_length]

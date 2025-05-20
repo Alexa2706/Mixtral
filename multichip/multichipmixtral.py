@@ -25,7 +25,6 @@ class FlaxMoeModelOutputWithPast:
     hidden_states: Optional[Tuple[Array]] = None
     attentions: Optional[Tuple[Array]] = None
     router_logits: Optional[Tuple[Array]] = None
-    past_key_values : Optional[Tuple[Tuple[Array]]] = None 
 
 @dataclass
 class FlaxMoeCausalLMOutput:
@@ -33,7 +32,8 @@ class FlaxMoeCausalLMOutput:
     hidden_states: Optional[Tuple[jnp.ndarray]] = None
     attentions: Optional[Tuple[jnp.ndarray]] = None
     router_logits: Optional[Tuple[jnp.ndarray]] = None
-    past_key_values : Optional[Tuple[Tuple[Array]]] = None 
+
+past_key_values = None
 
 class MixtralBlockSparseTop2MLP(nnx.Module):
     """MLP module with sparse routing for Mixtral architecture."""
@@ -42,11 +42,10 @@ class MixtralBlockSparseTop2MLP(nnx.Module):
         super().__init__()
         embed_dim = config.hidden_size
         inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * embed_dim
-
-        self.up_proj = nnx.Linear(embed_dim, inner_dim, kernel_init = nn.ones, use_bias=False, rngs = rngs)
-        self.gate_proj = nnx.Linear(embed_dim, inner_dim, kernel_init = nn.ones, use_bias=False, rngs = rngs)
-        self.down_proj = nnx.Linear(inner_dim, embed_dim, kernel_init = nn.ones, use_bias=False, rngs = rngs)
-        self.act_fn = jax.nn.relu
+        self.up_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
+        self.gate_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
+        self.down_proj = nnx.Linear(inner_dim, embed_dim, use_bias=False, rngs = rngs)
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states):
         gate_states = self.act_fn(self.up_proj(hidden_states)) * self.gate_proj(hidden_states)
@@ -72,17 +71,15 @@ class MixtralSparseMoeBlock(nnx.Module):
             dtype=self.dtype, 
             rngs=rngs
         )
-        
         # Create all experts, but each will be sharded to a different device
         
         for i in range(self.num_experts):
-            expert = MixtralBlockSparseTop2MLP(config, rngs=rngs)
-            setattr(self, f"experts_{i}", expert)
             device = device_mesh.devices[i]
             
             # Create expert with parameters on this device
             with jax.sharding.Mesh([device], axis_names=["expert"]):
                 expert = MixtralBlockSparseTop2MLP(config, rngs=rngs)
+                setattr(self, f"experts_{i}", expert)
             
             print(f"Expert {i} initialized on device {device}")
             # Apply expert sharding - each expert goes to a specific device
@@ -104,45 +101,44 @@ class MixtralSparseMoeBlock(nnx.Module):
         routing_weights /= jnp.sum(routing_weights, axis = -1, keepdims = True)
 
         routing_weights = routing_weights.astype(hidden_states.dtype)
-
         final_hidden_states = jnp.zeros(
             (batch_size * seq_len, hid_dim), dtype=hidden_states.dtype)
 
         # Create one-hot representation of selected experts
         for expert_idx in range(self.num_experts):
             expert_layer = self._get_expert(expert_idx)
-            
-            is_selected = selected_experts == expert_idx  # Shape: [batch_size*seq_len, top_k]
-            
-            token_mask = is_selected.any(axis=1)  # Shape: [batch_size*seq_len]
-            
-            positions = jnp.zeros((batch_size * seq_len, self.top_k), dtype=jnp.int32)
-            # For each position, set value to position index where the expert matches
+            token_masks = jnp.zeros((self.top_k, batch_size * seq_len), dtype=jnp.bool_)
             for k in range(self.top_k):
-                positions = positions.at[:, k].set(
-                    jnp.where(is_selected[:, k], k, positions[:, k])
-                )
-    
-            # Use gather to get the correct weight for each token
+                token_masks = token_masks.at[k].set(selected_experts[:, k] == expert_idx)
+            
+            # Combine masks across top_k dimension
+            token_mask = jnp.any(token_masks, axis=0)
+            
+            # Get the weights for this expert
             expert_weights = jnp.zeros((batch_size * seq_len), dtype=routing_weights.dtype)
             for k in range(self.top_k):
                 expert_weights = expert_weights + jnp.where(
-                    is_selected[:, k],
+                    selected_experts[:, k] == expert_idx,
                     routing_weights[:, k],
                     0.0
                 )
             
-            masked_outputs = jnp.where(
-                token_mask[:, None],  # Broadcast mask to cover hidden dimension
-                expert_layer(hidden_states),  # Process all inputs
-                0.0,  # Zero out non-relevant tokens
-            )
+            # Process all hidden states through the expert, but mask out irrelevant ones
+            # This approach processes more tokens than needed but is compatible with shard_map
+            expert_output = expert_layer(hidden_states)
             
-            masked_outputs = masked_outputs * expert_weights[:, None]
+            # Apply mask and weights
+            masked_output = jnp.where(
+                token_mask[:, None],  # Broadcast mask across hidden dimension
+                expert_output,
+                0.0
+            ) * expert_weights[:, None]
             
-            final_hidden_states = final_hidden_states + masked_outputs
+            # Add to final output
+            final_hidden_states = final_hidden_states + masked_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, seq_len, hid_dim)
+        # print(final_hidden_states)
         return final_hidden_states, router_logits
 
 
@@ -290,8 +286,9 @@ class MixtralAttention(nnx.Module):
         self.cached_value = None
         self.cache_index = None
 
-    def _concatenate_to_cache(self, key, value, query, attention_mask, past_key_values):
+    def _concatenate_to_cache(self, key, value, query, attention_mask):
         idx = self.layer_idx
+        global past_key_values
         cached_key = past_key_values[f'layer_{idx}']['cached_key']
         cached_value = past_key_values[f'layer_{idx}']['cached_value']
         cache_index = past_key_values[f'layer_{idx}']['cache_index']
@@ -312,17 +309,16 @@ class MixtralAttention(nnx.Module):
         )
         attention_mask = combine_masks(pad_mask, attention_mask)
         past_key_values[f'layer_{idx}'] = {
-            'cached_key' : key,
-            'cached_value' : value,
-            'cache_index' : cur_index
+            'cached_key' : cached_key,
+            'cached_value' : cached_value,
+            'cache_index' : cache_index
         }
-        return key, value, attention_mask, past_key_values
+        return key, value, attention_mask
 
     def __call__(
         self,
         hidden_states,  # (B, T, embed)
         position_ids,   # (1, T)
-        past_key_values,
         attention_mask,
         position_embeddings,
         deterministic: bool = False,
@@ -349,7 +345,7 @@ class MixtralAttention(nnx.Module):
         # print(query_states.shape, key_states.shape, value_states.shape)
         query_length, key_length = query_states.shape[1], key_states.shape[1]
         idx = self.layer_idx
-        print(idx, type(past_key_values))
+        global past_key_values
         cached_key = past_key_values[f'layer_{idx}']['cached_key']
         cached_value = past_key_values[f'layer_{idx}']['cached_value']
         cache_index = past_key_values[f'layer_{idx}']['cache_index']
@@ -366,8 +362,8 @@ class MixtralAttention(nnx.Module):
         attention_mask = combine_masks(attention_mask, causal_mask)
         
         if hasattr(self, "cached_key") or init_cache:
-            key_states, value_states, attention_mask, past_key_values = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask, past_key_values
+            key_states, value_states, attention_mask = self._concatenate_to_cache(
+                key_states, value_states, query_states, attention_mask
             )
         # print(query_states.shape, key_states.shape, value_states.shape)
         key_states = jnp.repeat(key_states, self.num_key_value_groups, axis=2)
@@ -425,7 +421,6 @@ class MixtralDecoderLayer(nnx.Module):
         hidden_states,
         attention_mask : Optional[Array] = None,
         position_ids : Optional[Array] = None,
-        past_key_values = None,
         output_attentions : Optional[bool] = False,
         deterministic : bool = False,
         output_router_logits : Optional[bool] = False,
@@ -443,7 +438,6 @@ class MixtralDecoderLayer(nnx.Module):
             position_embeddings = position_embeddings,
             attention_mask = attention_mask,
             deterministic = deterministic,
-            past_key_values = past_key_values,
             init_cache = init_cache,
             **kwargs,
         )
@@ -495,7 +489,6 @@ class MixtralModel(nnx.Module):
         input_ids : Array, 
         attention_mask : Optional[Array] = None,
         position_ids : Optional[Array] = None,
-        past_key_values = None,
         deterministic : bool = False,
         input_embeds : Optional[Array] = None,
         init_cache : Optional[bool] = None,
@@ -521,9 +514,6 @@ class MixtralModel(nnx.Module):
 
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids)
-            if self.padding_idx is not None:
-                mask = (input_ids != self.padding_idx).astype(jnp.float32)
-                embeddings = input_embeds * mask[..., None]
         
         if cache is None and init_cache:
             cache = [None for _ in range(len(self.layers))]
@@ -543,7 +533,6 @@ class MixtralModel(nnx.Module):
                 hidden_states = hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values = past_key_values,
                 deterministic = deterministic,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
@@ -552,10 +541,9 @@ class MixtralModel(nnx.Module):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
-            past_key_values = layer_outputs[1]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[2],)
+                all_self_attns += (layer_outputs[1],)
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
@@ -570,7 +558,6 @@ class MixtralModel(nnx.Module):
             hidden_states = all_hidden_states,
             attentions = all_self_attns,
             router_logits = all_router_logits,
-            past_key_values = past_key_values,
         )
     
 class FlaxMixtralForCausalLM(nnx.Module):
@@ -613,7 +600,6 @@ class FlaxMixtralForCausalLM(nnx.Module):
         attention_mask=None,
         position_ids=None,
         deterministic=True,
-        past_key_values = None,
         inputs_embeds=None,
         init_cache = True,
         labels=None,
@@ -628,7 +614,6 @@ class FlaxMixtralForCausalLM(nnx.Module):
             position_ids=position_ids,
             deterministic=deterministic,
             init_cache = init_cache,
-            past_key_values = past_key_values,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -644,8 +629,7 @@ class FlaxMixtralForCausalLM(nnx.Module):
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values = outputs.past_key_values
+            router_logits=outputs.router_logits
         )
 
     def generate(
@@ -653,7 +637,7 @@ class FlaxMixtralForCausalLM(nnx.Module):
         input_ids,
         attention_mask,
         max_new_tokens=20,
-        past_key_values = None,
+        key_values = None,
         pad_token_id=None,
         eos_token_id=None,
         position_ids = None,
@@ -667,14 +651,13 @@ class FlaxMixtralForCausalLM(nnx.Module):
         batch_size, seq_length = input_ids.shape
         max_length = seq_length + max_new_tokens
         has_reached_eos = jnp.zeros(batch_size, dtype=jnp.bool_)
-        
-        
+        global past_key_values
+        past_key_values = key_values
         position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
         # Now process the real prompt to fill in the cache for actual tokens
         outputs = self(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values = past_key_values,
             init_cache=True,
         )
         # Get next token prediction
@@ -686,62 +669,27 @@ class FlaxMixtralForCausalLM(nnx.Module):
         all_token_ids = jnp.concatenate([input_ids, next_token], axis=1)
         
         cur_len = seq_length
+        # Start auto-regressive generation loop
+        for i in range(1, 5):
+            print(i)
+            new_position_ids = position_ids[:, cur_len].reshape(-1, 1)
+            outputs = self(
+                input_ids=next_token,  # Only process the new token
+                attention_mask=attention_mask,
+                init_cache=True,
+                position_ids = new_position_ids
+            )
+            cur_len += 1
+            # Get logits and predict next token
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token = jnp.argmax(next_token_logits, axis=-1)
+            next_token = next_token[:, None]  # Add sequence dimension
+            # Add new token to results
+            all_token_ids = jnp.concatenate([all_token_ids, next_token], axis=1)
+            
+            # Update EOS tracking
+            if eos_token_id is not None:
+                has_reached_eos = has_reached_eos | (next_token[:, 0] == eos_token_id)
 
-        def generation_step(state, _):
-            tokens, past_key_values, attention_mask, position_ids, has_eos = state
-            
-            all_done = jnp.all(has_eos)
-        
-            def do_generation():
-                # Update position IDs for the new token
-                new_position_ids = position_ids[:, cur_len].reshape(-1, 1)
-                
-                # Get last token
-                next_token_input = tokens[:, -1:]
-                
-                # Forward pass with cache
-                outputs = self(
-                    input_ids=next_token_input,
-                    attention_mask=attention_mask,
-                    position_ids=new_position_ids,
-                    past_key_values = past_key_values,
-                    init_cache=True
-                )
-                
-                next_logits = outputs.logits
-                past_key_values = outputs.past_key_values
-                
-                # Get next token
-                next_token_id = jnp.argmax(next_logits[:, -1, :], axis=-1)
-                next_token_id = next_token_id[:, None]
-                
-                # Update sequence
-                new_tokens = jnp.concatenate([tokens, next_token_id], axis=1)
-                
-                # Update EOS tracking
-                new_eos = has_eos
-                if eos_token_id is not None:
-                    new_eos = new_eos | (next_token_id[:, 0] == eos_token_id)
-                
-                return (new_tokens, past_key_values, attention_mask, cur_len + 1, new_eos)
-            
-        
-            return jax.lax.cond(~all_done, do_generation)
-        
-        # Initial state
-        init_state = (
-            all_token_ids,         # Current sequence
-            past_key_values,       # KV cache
-            attention_mask,        # Attention mask 
-            cur_len,        # Current sequence length
-            has_reached_eos,       # EOS tracking
-        )
-        
-        # Run the generation loop
-        final_state = jax.lax.fori_loop(
-            0, max_new_tokens - 1, generation_step, init_state
-        )
-        
-        # Extract final sequence
-        final_tokens, _, _, _, _, _ = final_state
-        return final_tokens
+        return all_token_ids
+
