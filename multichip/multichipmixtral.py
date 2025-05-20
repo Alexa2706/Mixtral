@@ -361,14 +361,11 @@ class MixtralAttention(nnx.Module):
         attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask)
         
-        if hasattr(self, "cached_key") or init_cache:
-            key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
-            )
+        key_states, value_states, attention_mask = self._concatenate_to_cache(
+            key_states, value_states, query_states, attention_mask)
         # print(query_states.shape, key_states.shape, value_states.shape)
         key_states = jnp.repeat(key_states, self.num_key_value_groups, axis=2)
         value_states = jnp.repeat(value_states, self.num_key_value_groups, axis=2)
-
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -427,7 +424,7 @@ class MixtralDecoderLayer(nnx.Module):
         init_cache : Optional[bool] = False,
         position_embeddings : Optional[Tuple[Array, Array]] = None,
         **kwargs
-    ):
+    ): 
         residual = hidden_states
         # print(hidden_states)
         hidden_states = self.input_norm(hidden_states)
@@ -446,11 +443,31 @@ class MixtralDecoderLayer(nnx.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
+
+        hidden_states = jax.lax.all_gather(
+            hidden_states,
+            axis_name="X",   # Your mesh axis name
+            axis=0,          # Gather along batch dimension
+            tiled=True       # Combine the gathered slices
+        )
+        
         hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        
+        device_id = jax.lax.axis_index("X")
+        slice_size = hidden_states.shape[0] // num_devices
+        start_idx = device_id * slice_size
+        
+        # Use lax.dynamic_slice instead of hidden_states[start_idx:end_idx]
+        slice_sizes = (slice_size,) + tuple(hidden_states.shape[1:])
+        start_indices = (start_idx,) + (0,) * (len(hidden_states.shape) - 1)
+        
+        hidden_states = jax.lax.dynamic_slice(
+            hidden_states, 
+            start_indices, 
+            slice_sizes
+        )
         hidden_states = residual + hidden_states
         outputs = (hidden_states, )
-        outputs += (past_key_values, )
-
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -541,7 +558,6 @@ class MixtralModel(nnx.Module):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
-
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -636,11 +652,11 @@ class FlaxMixtralForCausalLM(nnx.Module):
         self,
         input_ids,
         attention_mask,
+        position_ids,
         max_new_tokens=20,
         key_values = None,
         pad_token_id=None,
         eos_token_id=None,
-        position_ids = None,
     ):
         """Generate text efficiently using properly initialized KV caching in NNX."""
         # Set defaults for special tokens
@@ -653,8 +669,9 @@ class FlaxMixtralForCausalLM(nnx.Module):
         has_reached_eos = jnp.zeros(batch_size, dtype=jnp.bool_)
         global past_key_values
         past_key_values = key_values
-        position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
+        
         # Now process the real prompt to fill in the cache for actual tokens
+
         outputs = self(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -662,32 +679,73 @@ class FlaxMixtralForCausalLM(nnx.Module):
         )
         # Get next token prediction
         next_token_logits = outputs.logits[:, -1, :]
-        next_token = jnp.argmax(next_token_logits, axis=-1)
+        
+        full_logits = jax.lax.all_gather(
+            next_token_logits, 
+            axis_name="X",
+            axis=0,
+            tiled=True
+        ) 
+
+        next_token = jnp.argmax(full_logits, axis=-1)
         next_token = next_token[:, None]  # Add sequence dimension
         
-        # # Add first generated token
-        all_token_ids = jnp.concatenate([input_ids, next_token], axis=1)
+        # Re-shard the token for data parallelism
+        device_id = jax.lax.axis_index("X")
+        slice_size = next_token.shape[0] // num_devices
+        start_idx = device_id * slice_size
         
+        start_indices = (start_idx, 0)
+        slice_sizes = (slice_size, 1)
+        
+        my_next_token = jax.lax.dynamic_slice(
+            next_token, 
+            start_indices, 
+            slice_sizes
+        )
+        # # Add first generated token
+        all_token_ids = jnp.concatenate([input_ids, my_next_token], axis=1)
+        print(my_next_token.shape)
         cur_len = seq_length
         # Start auto-regressive generation loop
-        for i in range(1, 5):
+        for i in range(1, 2):
             print(i)
             new_position_ids = position_ids[:, cur_len].reshape(-1, 1)
             outputs = self(
-                input_ids=next_token,  # Only process the new token
+                input_ids=my_next_token,  # Only process the new token
                 attention_mask=attention_mask,
                 init_cache=True,
                 position_ids = new_position_ids
             )
             cur_len += 1
-            # Get logits and predict next token
             next_token_logits = outputs.logits[:, -1, :]
-            next_token = jnp.argmax(next_token_logits, axis=-1)
+        
+            full_logits = jax.lax.all_gather(
+                next_token_logits, 
+                axis_name="X",
+                axis=0,
+                tiled=True
+            ) 
+
+            next_token = jnp.argmax(full_logits, axis=-1)
             next_token = next_token[:, None]  # Add sequence dimension
-            # Add new token to results
-            all_token_ids = jnp.concatenate([all_token_ids, next_token], axis=1)
             
-            # Update EOS tracking
+            # Re-shard the token for data parallelism
+            device_id = jax.lax.axis_index("X")
+            slice_size = next_token.shape[0] // num_devices
+            start_idx = device_id * slice_size
+            
+            start_indices = (start_idx, 0)
+            slice_sizes = (slice_size, 1)
+            
+            my_next_token = jax.lax.dynamic_slice(
+                next_token, 
+                start_indices, 
+                slice_sizes
+            )
+            # # Add first generated token
+            all_token_ids = jnp.concatenate([input_ids, my_next_token], axis=1)
+                
             if eos_token_id is not None:
                 has_reached_eos = has_reached_eos | (next_token[:, 0] == eos_token_id)
 

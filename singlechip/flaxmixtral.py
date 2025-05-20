@@ -291,14 +291,11 @@ class MixtralAttention(nnx.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         # print(query_states.shape, key_states.shape, value_states.shape)
         query_length, key_length = query_states.shape[1], key_states.shape[1]
-        if hasattr(self, "cached_key"):
-            mask_shift = self.cache_index
-            max_decoder_length = self.cached_key.shape[1]
-            causal_mask = lax.dynamic_slice(
-                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
-            )
-        else:
-            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+        mask_shift = self.cache_index
+        max_decoder_length = self.cached_key.shape[1]
+        causal_mask = lax.dynamic_slice(
+            self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+        )
         # print(layer_idx)
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
@@ -306,21 +303,14 @@ class MixtralAttention(nnx.Module):
         attention_mask = combine_masks(attention_mask, causal_mask)
         # Later in the code:
         
-        if hasattr(self, "cached_key") or init_cache:
-            key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
-            )
+        key_states, value_states, attention_mask = self._concatenate_to_cache(
+            key_states, value_states, query_states, attention_mask
+        )
         # print(query_states.shape, key_states.shape, value_states.shape)
         
         key_states = jnp.repeat(key_states, self.num_key_value_groups, axis=2)
         value_states = jnp.repeat(value_states, self.num_key_value_groups, axis=2)
-        # causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-        # if attention_mask is not None:
-        #     attention_mask = jnp.broadcast_to(
-        #         jnp.expand_dims(attention_mask, axis=(-3, -2)), 
-        #         causal_mask.shape
-        #     )
-        #     attention_mask = combine_masks(attention_mask, causal_mask)
+
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -330,48 +320,21 @@ class MixtralAttention(nnx.Module):
         # Transpose for attention
             
             q = jnp.transpose(q, (0, 2, 1, 3))  # [batch, heads, seq_len, head_dim]
-            #q = jax.lax.with_sharding_constraint(q, P(None, 'tp', None, None))
 
             k = jnp.transpose(k, (0, 2, 1, 3))
-            #k = jax.lax.with_sharding_constraint(k, P(None, 'tp', None, None))
 
             v = jnp.transpose(v, (0, 2, 1, 3))
-            # v = jax.lax.with_sharding_constraint(v, P(None, 'tp', None, None))
             
-            # Compute attention scores
             attention_scores = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) * self.scaling
-            # Add bias
-            # attention_scores = jax.lax.with_sharding_constraint(
-            # attention_scores, 
-            #     jax.sharding.PartitionSpec(None, 'tp', None, None)
-            # )
-            # v = jax.lax.with_sharding_constraint(q, P(None, 'tp', None, None))
+
             attention_scores = attention_scores + bias
-            # Apply softmax
-            attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
+
             attn_weights = jax.nn.softmax(attention_scores, axis=-1).astype(self.dtype)
-            # attn_weights = jax.lax.with_sharding_constraint(
-            #     attn_weights, 
-            #     jax.sharding.PartitionSpec(None, 'tp', None, None)
-            # )
-            # Apply dropout if training
-            if not deterministic and self.attention_dropout > 0:
-                dropout_rng = jax.random.PRNGKey(0)  # In a real implementation, use a proper RNG
-                attn_weights = jnp.where(
-                        jax.random.uniform(dropout_rng, attn_weights.shape) < self.attention_dropout,
-                        jnp.zeros_like(attn_weights),
-                        attn_weights / (1.0 - self.attention_dropout)
-                )
 
-            # Compute attention output
             attn_output = jnp.matmul(attn_weights, v)
-            # attn_output = jax.lax.with_sharding_constraint(attn_output, P(None, None, 'tp'))
-            # Apply sharding constraints - NNX handles this automatically
-            # based on parameter annotations
 
-            # Transpose back
             attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
-            # jax.debug.visualize_array_sharding(attn_output[0, :, 0, :])
+
             return attn_output, attn_weights
 
         attn_output, attn_weights = attention_fn(
