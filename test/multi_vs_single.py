@@ -41,13 +41,11 @@ def run_single_chip(input_data, attention_mask, max_len):
 
 
 def run_multi_chip(input_data, attention_mask, max_len):
-    # Same initial setup as before
     print("Creating sharded model...")
     model = ShardedModel(config)
     print("Sharded Model created")
     batch_size, seq_len = input_data.shape
     
-    # Handle padding - this is fine during compilation since it's based on shape
     inputs_spec = P("X")  
     pad_size = 0
     if batch_size % num_devices != 0:
@@ -60,17 +58,13 @@ def run_multi_chip(input_data, attention_mask, max_len):
         
         batch_size += pad_size
 
-    # Same sharding setup
     sharded_input = jax.device_put(input_data, NamedSharding(device_mesh, inputs_spec))
-    out_spec = P("X")
     
-    # Set up attention mask
     batch_size, seq_len = input_data.shape
     extended_attention_mask = jnp.ones((batch_size, max_len), dtype="i4")
     extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
     sharded_mask = jax.device_put(extended_attention_mask, NamedSharding(device_mesh, P("X", None)))
 
-    # KV Cache setup - same as before
     past_key_values = {}
     for i in range(config.num_hidden_layers):
         layer_key = f'layer_{i}'
@@ -145,37 +139,59 @@ def run_multi_chip(input_data, attention_mask, max_len):
     next_token = jnp.argmax(next_token_logits, axis=-1)
     all_token_ids = all_token_ids.at[:, seq_len].set(next_token)
     
-    cur_len = seq_len + 1
-    for i in range(1, max_len - seq_len):
-        print(i)
-        next_token_input = next_token[:, None]
+    def generate_step(i, carry):
+        all_tokens, cache = carry
+        cur_len = seq_len + 1 + i
+        
+        next_token_input = lax.dynamic_slice(
+            all_tokens, 
+            (0, cur_len-1), 
+            (batch_size, 1)
+        )
         next_token_input = jax.device_put(
             next_token_input, 
             NamedSharding(device_mesh, P("X", None))
         )
         
-        new_position_ids = sharded_position_ids[:, cur_len-1:cur_len]
+        new_position_ids = lax.dynamic_slice(
+            sharded_position_ids,
+            (0, cur_len-1),
+            (batch_size, 1)
+        )
         
-    #     # Forward pass with JIT
-        logits, sharded_cache = jit_forward(
+        # Forward pass
+        logits, updated_cache = jit_forward(
             next_token_input,
             sharded_mask,
-            sharded_cache,
+            cache,
             new_position_ids
         )
         
         next_token_logits = logits[:, -1, :]
         next_token = jnp.argmax(next_token_logits, axis=-1)
-        all_token_ids = all_token_ids.at[:, cur_len].set(next_token)
         
-        cur_len += 1
+        updated_tokens = lax.dynamic_update_slice(
+            all_tokens,
+            next_token[:, None],  
+            (0, cur_len)
+        )
+        
+        return updated_tokens, updated_cache
+    
+    num_new_tokens = max_len - seq_len - 1
+    final_tokens, _ = lax.fori_loop(
+        0, 
+        num_new_tokens,
+        generate_step,
+        (all_token_ids, sharded_cache)
+    )
     
     # Remove padding if necessary
     if pad_size:
         original_batch_size = input_data.shape[0] - pad_size
-        all_token_ids = all_token_ids[:original_batch_size]
+        final_tokens = final_tokens[:original_batch_size]
     
-    return all_token_ids[:, :cur_len]
+    return final_tokens
   
 if __name__ == '__main__':
     batch_size = 8
@@ -188,7 +204,6 @@ if __name__ == '__main__':
     multi_chip = run_multi_chip(input_data, attention_mask, max_len)
     print(single_chip)
     print(multi_chip)
-    # print(multi_chip) #this doesnt
     if np.array_equal(np.array(single_chip), np.array(multi_chip)):
         print('Test successful!')
     else:
