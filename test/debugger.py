@@ -12,118 +12,30 @@ from jax_config import cpu_devices, axis_name, num_devices, device_mesh
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax import lax
 
-class MixtralBlockSparseTop2MLP(nnx.Module):
-    """MLP module with sparse routing for Mixtral architecture."""
-
-    def __init__(self, config: MixtralConfig, rngs : nnx.Rngs):
-        super().__init__()
-        embed_dim = config.hidden_size
-        inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * embed_dim
-        self.up_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
-        self.gate_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
-        self.down_proj = nnx.Linear(inner_dim, embed_dim, use_bias=False, rngs = rngs)
-        self.act_fn = jax.nn.silu
-
-    def __call__(self, hidden_states):
-        gate_states = self.act_fn(self.up_proj(hidden_states)) * self.gate_proj(hidden_states)
-        hidden_states = self.down_proj(gate_states)
-        return hidden_states
-
-
-class MixtralSparseMoeBlock(nnx.Module):
-    """Sparse Mixture of Experts block for Mixtral with expert parallelism."""
-
-    def __init__(self, config: MixtralConfig, dtype, rngs: nnx.Rngs):
-        super().__init__()
-        self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
-        self.dtype = dtype
-        # Router (gate) is replicated across all devices
-        self.gate = nnx.Linear(
-            config.hidden_size,
-            config.num_local_experts,
-            use_bias=False,
-            dtype=self.dtype,
-            rngs=rngs
-        )
-
-        self.experts = []
-        for i in range(self.num_experts):
-            expert = MixtralBlockSparseTop2MLP(config, rngs=rngs)
-            self.experts.append(expert)
-            print(f"Created expert {i}")
-
-        self.jitter_noise = config.router_jitter_noise
-
-
-    def __call__(self, hidden_states):
-        device_id = jax.lax.axis_index("X")
-        batch_size, seq_len, hid_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hid_dim)
-        router_logits = self.gate(hidden_states)
-
-        routing_weights = jax.nn.softmax(router_logits, axis = 1)
-        routing_weights, selected_experts = lax.top_k(routing_weights, self.top_k)
-        routing_weights /= jnp.sum(routing_weights, axis = -1, keepdims = True)
-
-        routing_weights = routing_weights.astype(hidden_states.dtype)
-        final_hidden_states = jnp.zeros_like(hidden_states)
-
-        # This loop calculates the combined weights for tokens that are routed to the *current device's expert*.
-        # It assumes expert `device_id` is the one "local" or "designated" for this device.
-        # This implies self.num_experts should be equal to the number of devices in the "X" mesh.
-        
-        # Create a mask for tokens that select the current device's designated expert
-        # and accumulate their weights.
-        # token_mask_for_local_expert: (num_tokens_on_device), true if token is for local expert
-        # expert_weights_for_local_expert: (num_tokens_on_device), sum of routing_weights if token is for local expert
-        
-        token_mask_for_local_expert = jnp.zeros(batch_size * seq_len, dtype=jnp.bool_)
-        expert_weights_for_local_expert = jnp.zeros(batch_size * seq_len, dtype=routing_weights.dtype)
-
-        for k in range(self.top_k):
-            # is_selected_for_local_expert: (num_tokens_on_device), true if the k-th top expert is the local one
-            is_selected_for_local_expert = (selected_experts[:, k] == device_id)
-            
-            token_mask_for_local_expert = token_mask_for_local_expert | is_selected_for_local_expert
-            
-            expert_weights_for_local_expert = jnp.where(
-                is_selected_for_local_expert,
-                expert_weights_for_local_expert + routing_weights[:, k],
-                expert_weights_for_local_expert
-            )
-        
-        # # The expert on the current device processes all hidden_states passed to it (local batch slice).
-        # # jax.lax.switch is JIT-compatible for selecting the expert.
-        # # self.experts should be a list/tuple of callable nnx.Modules.
-        # # device_id (tracer) selects which expert callable to use.
-        # # This assumes len(self.experts) is at least num_devices. If num_experts == num_devices, this is fine.
-        current_expert_output = jax.lax.switch(
-            device_id,
-            self.experts, # Sequence of callable experts
-            hidden_states # Operand for the selected expert
-        )
+def pcc(x, y):
+    if hasattr(x, 'numpy'):
+        x = x.numpy()  # PyTorch tensor
+    if hasattr(y, 'numpy'):
+        y = y.numpy()  # PyTorch tensor
     
-    # # Apply mask and weights: only contribute if token was routed to this device's expert.
-    # # weighted_expert_output has shape (num_tokens_on_device, hid_dim)
-        weighted_expert_output = jnp.where(
-            token_mask_for_local_expert[:, None], # Broadcast mask to (num_tokens, 1)
-            current_expert_output * expert_weights_for_local_expert[:, None], # Broadcast weights
-            jnp.zeros_like(current_expert_output)
-        )
+    # Convert JAX arrays to numpy if needed
+    if isinstance(x, jnp.ndarray):
+        x = np.array(x)
+    if isinstance(y, jnp.ndarray):
+        y = np.array(y)
     
-    # # Reshape back to (batch_slice_size, seq_len, hid_dim)
-        weighted_expert_output_reshaped = weighted_expert_output.reshape(batch_size, seq_len, hid_dim)
+    # Flatten tensors
+    x_flat = x.flatten()
+    y_flat = y.flatten()
     
-    # # All-reduce across devices to sum expert outputs.
-    # # Each device contributes the processed output for tokens routed to its expert.
-    # # The sum over "X" combines these contributions for all tokens.
-        final_output = jax.lax.psum(weighted_expert_output_reshaped, axis_name="X")
-        return final_output
+    # Calculate correlation
+    correlation = np.corrcoef(x_flat, y_flat)[0, 1]
+    
+    return correlation
 
-config = MixtralConfig(num_hidden_layers=1)
+
+
+config = MixtralConfig(num_hidden_layers=1, intermediate_size=4096)
 prng_key = jax.random.PRNGKey(0)
 rngs = nnx.Rngs(0)
 batch_size = 8
@@ -132,11 +44,11 @@ tokens = 5
 hidden_size = 4096
 max_len = seq_len + tokens
 input_data = jax.random.normal(key = prng_key, shape = (batch_size, seq_len, hidden_size))
-attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+attention_mask = jnp.ones((batch_size, seq_len), dtype = jnp.int32)
+model = MixtralSparseMoeBlock(config, dtype = jnp.float32, rngs = rngs)
 
 def runner(input_data, attention_mask, max_len):
     print("Creating sharded model...")
-    model = MixtralSparseMoeBlock(config, dtype = jnp.float16, rngs = rngs)
     print("Sharded Model created")
     batch_size, seq_len, hidden_size = input_data.shape
     
@@ -200,7 +112,7 @@ def runner(input_data, attention_mask, max_len):
         
     position_ids = jnp.cumsum(extended_attention_mask, axis=-1) - 1
     sharded_position_ids = jax.device_put(position_ids, NamedSharding(device_mesh, P("X", None)))
-    
+
     def forward_pass(x):
         # Single forward pass through the model
         outputs = model(
@@ -217,7 +129,7 @@ def runner(input_data, attention_mask, max_len):
         forward_pass,
         device_mesh,
         in_specs=(inputs_spec), 
-        out_specs=(P(None, None, None)),  # logits and updated cache
+        out_specs=(P("X", None, None)),  # logits and updated cache
         check_rep=False,
     )
     
@@ -236,44 +148,103 @@ def runner(input_data, attention_mask, max_len):
         # sharded_position_ids
     )
     return logits
-    # Get next token
-    next_token_logits = logits[:, -1, :]
-    next_token = jnp.argmax(next_token_logits, axis=-1)
-    # all_token_ids = all_token_ids.at[:, seq_len].set(next_token)
-    
-    # Continue generation for remaining tokens
-    cur_len = seq_len + 1
-    # for i in range(1, max_len - seq_len):
-    #     # Prepare next input (only the last generated token)
-    #     next_token_input = next_token[:, None]
-    #     next_token_input = jax.device_put(
-    #         next_token_input, 
-    #         NamedSharding(device_mesh, P("X", None))
-    #     )
-        
-    #     # Update position ids for the new token
-    #     new_position_ids = sharded_position_ids[:, cur_len-1:cur_len]
-        
-    #     # Forward pass with JIT
-    #     logits, sharded_cache = jit_forward(
-    #         next_token_input,
-    #         sharded_mask,
-    #         sharded_cache,
-    #         new_position_ids
-    #     )
-        
-    #     # Get next token
-    #     next_token_logits = logits[:, -1, :]
-    #     next_token = jnp.argmax(next_token_logits, axis=-1)
-    #     all_token_ids = all_token_ids.at[:, cur_len].set(next_token)
-        
-    #     cur_len += 1
-    
-    # Remove padding if necessary
-    if pad_size:
-        original_batch_size = input_data.shape[0] - pad_size
-        all_token_ids = all_token_ids[:original_batch_size]
-    
-    return all_token_ids[:, :cur_len]
 
-runner(input_data, attention_mask, max_len)
+res = runner(input_data, attention_mask, max_len)
+print(res.shape)
+print(res)
+
+class MixtralBlockSparseTop2MLP2(nnx.Module):
+    """MLP module with sparse routing for Mixtral architecture."""
+    
+    def __init__(self, config: MixtralConfig, rngs : nnx.Rngs):
+        super().__init__()
+        embed_dim = config.hidden_size
+        inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * embed_dim
+        self.up_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
+        self.gate_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
+        self.down_proj = nnx.Linear(inner_dim, embed_dim, use_bias=False, rngs = rngs)
+        self.act_fn = jax.nn.silu
+
+    def __call__(self, hidden_states):
+        gate_states = self.act_fn(self.up_proj(hidden_states)) * self.gate_proj(hidden_states)
+        hidden_states = self.down_proj(gate_states)
+        return hidden_states
+
+class MixtralSparseMoeBlock2(nnx.Module):
+    """Sparse Mixture of Experts block for Mixtral."""
+    
+    def __init__(self, config: MixtralConfig, dtype, rngs : nnx.Rngs):
+        super().__init__()
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        self.dtype = dtype
+        self.gate = nnx.Linear(
+            config.hidden_size, 
+            config.num_local_experts, 
+            use_bias=False, 
+            dtype=self.dtype, 
+            rngs = rngs
+        )
+
+        for i in range(self.num_experts):
+            setattr(self, f"experts_{i}", MixtralBlockSparseTop2MLP(config, rngs = rngs))
+        self.jitter_noise = config.router_jitter_noise
+
+    def _get_expert(self, idx):
+        """Helper to get expert by index"""
+        return getattr(self, f"experts_{idx}")
+
+    def __call__(self, hidden_states):
+        batch_size, seq_len, hid_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hid_dim)
+        router_logits = self.gate(hidden_states)
+        routing_weights = jax.nn.softmax(router_logits, axis = 1)
+        routing_weights, selected_experts = lax.top_k(routing_weights, self.top_k)
+        routing_weights /= jnp.sum(routing_weights, axis = -1, keepdims = True)
+        # print(routing_weights, selected_experts)
+        routing_weights = routing_weights.astype(hidden_states.dtype)
+
+        final_hidden_states = jnp.zeros(
+            (batch_size * seq_len, hid_dim), dtype=hidden_states.dtype)
+
+        # Create one-hot representation of selected experts
+        expert_mask = jax.nn.one_hot(selected_experts, num_classes = self.num_experts, dtype = jnp.int8).transpose(2, 1, 0)
+        for expert_idx in range(self.num_experts):
+            expert_layer = self._get_expert(expert_idx)
+            idx, top_x = jnp.where(expert_mask[expert_idx])
+            current_state = hidden_states[None, top_x].reshape(-1, hid_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states = final_hidden_states.at[top_x].add(current_hidden_states)
+
+        final_hidden_states = final_hidden_states.reshape(batch_size, seq_len, hid_dim)
+        # print(final_hidden_states)
+        return final_hidden_states, router_logits
+
+model2 = MixtralSparseMoeBlock2(config, dtype = jnp.float32, rngs = rngs)
+def run_single_chip(input_data, attention_mask, max_len):
+    print("Creating Regular model...")
+    model2.gate.kernel.value = model.gate.kernel.value
+    for i in range(8):
+        expert2 = getattr(model2, f"experts_{i}")
+        expert = getattr(model, f"experts_{i}")
+        expert2.up_proj.kernel.value = expert.up_proj.kernel.value
+        expert2.down_proj.kernel.value = expert.down_proj.kernel.value
+        expert2.gate_proj.kernel.value = expert.gate_proj.kernel.value
+    print("Regular model created")
+    batch_size, seq_len, hidden_size = input_data.shape
+    extended_attention_mask = jnp.ones((batch_size, max_len), dtype = "i4")
+    extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+
+    out1, out2 = model2(
+        hidden_states = input_data
+    )
+    return out1
+
+res2 = run_single_chip(input_data, attention_mask, max_len)
+print(res2.shape)
+print(res2)
+
+print(pcc(res, res2))
+print(pcc(model2.gate.kernel.value, model.gate.kernel.value))

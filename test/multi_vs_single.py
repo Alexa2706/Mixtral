@@ -15,7 +15,7 @@ from multichip.multichipmixtral import FlaxMixtralForCausalLM as ShardedModel
 from singlechip.flaxconfigmixtral import MixtralConfig
 from jax_config import cpu_devices, axis_name, num_devices, device_mesh
 
-config = MixtralConfig(num_hidden_layers=1)
+config = MixtralConfig(num_hidden_layers=2, intermediate_size=1024)
 prng_key = jax.random.PRNGKey(0)
 rngs = nnx.Rngs(0)
 
@@ -40,7 +40,6 @@ def run_single_chip(input_data, attention_mask, max_len):
     return out
 
 
-# @partial(jax.jit, static_argnames=['max_len'])
 def run_multi_chip(input_data, attention_mask, max_len):
     # Same initial setup as before
     print("Creating sharded model...")
@@ -108,20 +107,20 @@ def run_multi_chip(input_data, attention_mask, max_len):
         }
         
     position_ids = jnp.cumsum(extended_attention_mask, axis=-1) - 1
+    position_ids_first = jnp.cumsum(attention_mask, axis = 1) - 1
     sharded_position_ids = jax.device_put(position_ids, NamedSharding(device_mesh, P("X", None)))
+    sharded_position_ids_first = jax.device_put(position_ids_first, NamedSharding(device_mesh, P("X", None)))
     
     def forward_pass(x, mask, cache, pos):
-        # Single forward pass through the model
         outputs = model(
             input_ids=x,
             attention_mask=mask,
             past_key_values=cache,
-            # position_ids=pos,
+            position_ids=pos,
             init_cache=True,
         )
         return outputs.logits, outputs.past_key_values
     
-    # Create sharded and JIT-compiled forward function
     sharded_forward = shard_map(
         forward_pass,
         device_mesh,
@@ -130,54 +129,46 @@ def run_multi_chip(input_data, attention_mask, max_len):
         check_rep=False,
     )
     
-    # JIT compile the sharded forward pass
     jit_forward = jax.jit(sharded_forward, donate_argnums=(2, ))
     
-    # Manual generation loop (outside JIT)
     all_token_ids = jnp.zeros((batch_size, max_len), dtype=input_data.dtype)
     all_token_ids = all_token_ids.at[:, :seq_len].set(sharded_input)
     
-    # Process initial prompt
     logits, sharded_cache = jit_forward(
         sharded_input, 
         sharded_mask, 
         sharded_cache, 
-        sharded_position_ids
+        sharded_position_ids_first
     )
     
-    # Get next token
     next_token_logits = logits[:, -1, :]
-    print(next_token_logits)
     next_token = jnp.argmax(next_token_logits, axis=-1)
-    # all_token_ids = all_token_ids.at[:, seq_len].set(next_token)
+    all_token_ids = all_token_ids.at[:, seq_len].set(next_token)
     
-    # Continue generation for remaining tokens
     cur_len = seq_len + 1
-    # for i in range(1, max_len - seq_len):
-    #     # Prepare next input (only the last generated token)
-    #     next_token_input = next_token[:, None]
-    #     next_token_input = jax.device_put(
-    #         next_token_input, 
-    #         NamedSharding(device_mesh, P("X", None))
-    #     )
+    for i in range(1, max_len - seq_len):
+        print(i)
+        next_token_input = next_token[:, None]
+        next_token_input = jax.device_put(
+            next_token_input, 
+            NamedSharding(device_mesh, P("X", None))
+        )
         
-    #     # Update position ids for the new token
-    #     new_position_ids = sharded_position_ids[:, cur_len-1:cur_len]
+        new_position_ids = sharded_position_ids[:, cur_len-1:cur_len]
         
     #     # Forward pass with JIT
-    #     logits, sharded_cache = jit_forward(
-    #         next_token_input,
-    #         sharded_mask,
-    #         sharded_cache,
-    #         new_position_ids
-    #     )
+        logits, sharded_cache = jit_forward(
+            next_token_input,
+            sharded_mask,
+            sharded_cache,
+            new_position_ids
+        )
         
-    #     # Get next token
-    #     next_token_logits = logits[:, -1, :]
-    #     next_token = jnp.argmax(next_token_logits, axis=-1)
-    #     all_token_ids = all_token_ids.at[:, cur_len].set(next_token)
+        next_token_logits = logits[:, -1, :]
+        next_token = jnp.argmax(next_token_logits, axis=-1)
+        all_token_ids = all_token_ids.at[:, cur_len].set(next_token)
         
-    #     cur_len += 1
+        cur_len += 1
     
     # Remove padding if necessary
     if pad_size:
@@ -189,16 +180,16 @@ def run_multi_chip(input_data, attention_mask, max_len):
 if __name__ == '__main__':
     batch_size = 8
     seq_len = 10
-    tokens = 5
+    tokens = 100
     max_len = seq_len + tokens
     input_data = jax.random.randint(key = prng_key, shape = (batch_size, seq_len), minval = 0, maxval = config.vocab_size)
     attention_mask = jnp.ones_like(input_data)
-    # single_chip = run_single_chip(input_data, attention_mask, max_len)
+    single_chip = run_single_chip(input_data, attention_mask, max_len)
     multi_chip = run_multi_chip(input_data, attention_mask, max_len)
-    print(multi_chip.shape)
+    print(single_chip)
     print(multi_chip)
     # print(multi_chip) #this doesnt
-    # if np.array_equal(np.array(single_chip), np.array(multi_chip)):
-    #     print('Test successful!')
-    # else:
-    #     print('Something doesnt work :(')
+    if np.array_equal(np.array(single_chip), np.array(multi_chip)):
+        print('Test successful!')
+    else:
+        print('Something doesnt work :(')
