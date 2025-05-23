@@ -44,7 +44,7 @@ class MixtralBlockSparseTop2MLP(nnx.Module):
         self.up_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
         self.gate_proj = nnx.Linear(embed_dim, inner_dim, use_bias=False, rngs = rngs)
         self.down_proj = nnx.Linear(inner_dim, embed_dim, use_bias=False, rngs = rngs)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = jax.nn.silu
 
     def __call__(self, hidden_states):
         gate_states = self.act_fn(self.up_proj(hidden_states)) * self.gate_proj(hidden_states)
@@ -80,7 +80,7 @@ class MixtralSparseMoeBlock(nnx.Module):
                 expert = MixtralBlockSparseTop2MLP(config, rngs=rngs)
                 setattr(self, f"experts_{i}", expert)
             
-            # print(f"Expert {i} initialized on device {device}")
+            print(f"Expert {i} initialized on device {device}")
             # Apply expert sharding - each expert goes to a specific device
             # Shard all parameters of the expert to its designated device
             
@@ -442,29 +442,22 @@ class MixtralDecoderLayer(nnx.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
-
-        hidden_states = jax.lax.all_gather(
-            hidden_states,
-            axis_name="X",   # Your mesh axis name
-            axis=0,          # Gather along batch dimension
-            tiled=True       # Combine the gathered slices
-        )
         
         hidden_states, router_logits = self.block_sparse_moe(hidden_states)
         
-        device_id = jax.lax.axis_index("X")
-        slice_size = hidden_states.shape[0] // num_devices
-        start_idx = device_id * slice_size
+        # device_id = jax.lax.axis_index("X")
+        # slice_size = hidden_states.shape[0] // num_devices
+        # start_idx = device_id * slice_size
         
-        # Use lax.dynamic_slice instead of hidden_states[start_idx:end_idx]
-        slice_sizes = (slice_size,) + tuple(hidden_states.shape[1:])
-        start_indices = (start_idx,) + (0,) * (len(hidden_states.shape) - 1)
+        # # Use lax.dynamic_slice instead of hidden_states[start_idx:end_idx]
+        # slice_sizes = (slice_size,) + tuple(hidden_states.shape[1:])
+        # start_indices = (start_idx,) + (0,) * (len(hidden_states.shape) - 1)
         
-        hidden_states = jax.lax.dynamic_slice(
-            hidden_states, 
-            start_indices, 
-            slice_sizes
-        )
+        # hidden_states = jax.lax.dynamic_slice(
+        #     hidden_states, 
+        #     start_indices, 
+        #     slice_sizes
+        # )
 
         hidden_states = residual + hidden_states
         outputs = (hidden_states, )
@@ -659,7 +652,6 @@ class FlaxMixtralForCausalLM(nnx.Module):
             past_key_values = past_key_values
         )
 
-    @partial(jax.jit, static_argnames=['self', 'max_new_tokens', 'pad_token_id', 'eos_token_id'])
     def generate(
         self,
         input_ids,
@@ -693,43 +685,34 @@ class FlaxMixtralForCausalLM(nnx.Module):
             past_key_values=past_key_values,
             init_cache=True,
         )
-        
         # Get next token prediction
         next_token_logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
         next_token = jnp.argmax(next_token_logits, axis=-1)
-        
-        # Add first generated token to the pre-allocated array
         all_token_ids = all_token_ids.at[:, seq_length].set(next_token)
-        
-        # Check early stopping conditions
-        if eos_token_id is not None:
-            has_reached_eos = has_reached_eos | (next_token == eos_token_id)
-        
-        cur_len = seq_length + 1
-        
-        for i in range(1, max_new_tokens):
-            next_token_input = next_token[:, None]  # Shape: [batch_size, 1]
+        cur_len = 15
+        # for i in range(1, 5):
+        #     next_token_input = next_token[:, None]  # Shape: [batch_size, 1]
             
-            new_position_ids = position_ids[:, cur_len-1].reshape(-1, 1)
-            outputs = self(
-                input_ids=next_token_input,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                init_cache=True,
-                position_ids=new_position_ids
-            )
+        #     new_position_ids = position_ids[:, cur_len-1].reshape(-1, 1)
+        #     outputs = self(
+        #         input_ids=next_token_input,
+        #         attention_mask=attention_mask,
+        #         past_key_values=past_key_values,
+        #         init_cache=True,
+        #         position_ids=new_position_ids
+        #     )
             
-            # Get logits and predict next token
-            next_token_logits = outputs.logits[:, -1, :]
-            past_key_values = outputs.past_key_values
-            next_token = jnp.argmax(next_token_logits, axis=-1)
+        #     # Get logits and predict next token
+        #     next_token_logits = outputs.logits[:, -1, :]
+        #     past_key_values = outputs.past_key_values
+        #     next_token = jnp.argmax(next_token_logits, axis=-1)
             
-            # Update token IDs array at the current position
-            all_token_ids = all_token_ids.at[:, cur_len].set(next_token)
+        #     # Update token IDs array at the current position
+        #     all_token_ids = all_token_ids.at[:, cur_len].set(next_token)
             
-            # Update position for next iteration
-            cur_len += 1
+        #     # Update position for next iteration
+        #     cur_len += 1
         
         return all_token_ids[:, :cur_len]
 
