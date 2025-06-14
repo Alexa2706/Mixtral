@@ -5,7 +5,7 @@ A high-performance JAX/Flax implementation of Mixtral 8x7B with support for both
 ## 🚀 Features
 
 - **JAX/Flax Implementation**: Built using JAX and the new Flax NNX API for optimal performance
-- **Multi-Device Support**: Distributed inference with data parallelism (DP) and expert parallelism (EP)
+- **Multi-Device Support**: Distributed inference with tensor parallelism (TP)
 - **Efficient MoE Routing**: Optimized sparse routing for Mixture of Experts layers
 - **KV Caching**: Fast autoregressive generation with key-value caching
 - **Weight Conversion**: Convert pre-trained HuggingFace PyTorch weights to JAX format
@@ -88,7 +88,7 @@ This test:
 ### Key Components
 
 1. **MixtralSparseMoeBlock**: Implements the core Mixture of Experts routing logic
-2. **MixtralAttention**: Multi-head attention with rotary position embeddings
+2. **MixtralAttention**: Grouped Multi-head Attention with rotary position embeddings
 3. **MixtralDecoderLayer**: Complete transformer decoder layer with MoE
 4. **FlaxMixtralForCausalLM**: Complete causal language model
 
@@ -104,7 +104,7 @@ The multi-device implementation uses:
 - **Efficient MoE Routing**: Optimized sparse expert selection
 - **KV Caching**: Cached key-value pairs for fast generation
 - **Memory Efficient**: Careful memory management for large models
-- **JIT Compilation**: JAX JIT compilation for optimal performance
+- **JIT Compilation**: JAX NNX JIT compilation for optimal performance
 
 ## 📊 Model Configuration
 
